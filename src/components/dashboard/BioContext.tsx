@@ -1,0 +1,327 @@
+import {
+  createContext,
+  useCallback,
+  useContext,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ReactNode,
+} from "react";
+import { toast } from "sonner";
+import {
+  createBlock as apiCreateBlock,
+  deleteBlock as apiDeleteBlock,
+  fetchMyBio,
+  reorderBlocks as apiReorderBlocks,
+  updateBlock as apiUpdateBlock,
+  updatePage,
+  updateProfile,
+  type BioBundle,
+} from "@/lib/bio-data";
+import { mergeTheme, type BioBlock, type BioProfile, type BioTheme, type BlockConfig } from "@/lib/bio-types";
+import { getTemplate } from "@/lib/templates";
+import { getBlockDef } from "@/lib/blocks";
+
+export type SaveState = "idle" | "saving" | "saved";
+
+interface BioContextValue {
+  bundle: BioBundle;
+  theme: BioTheme;
+  saveState: SaveState;
+  publishing: boolean;
+  patchProfile: (patch: Partial<BioProfile>) => void;
+  patchTheme: (patch: Partial<BioTheme>) => void;
+  applyTemplate: (templateId: string) => void;
+  addBlock: (type: string) => Promise<void>;
+  patchBlock: (id: string, patch: { title?: string | null; url?: string | null; config?: BlockConfig; is_visible?: boolean }) => void;
+  duplicateBlock: (id: string) => Promise<void>;
+  removeBlock: (id: string) => Promise<void>;
+  moveBlock: (fromId: string, toIndex: number) => void;
+  publish: () => Promise<void>;
+  refresh: () => Promise<void>;
+}
+
+const BioContext = createContext<BioContextValue | null>(null);
+
+export function useBio() {
+  const ctx = useContext(BioContext);
+  if (!ctx) throw new Error("useBio must be used inside BioProvider");
+  return ctx;
+}
+
+export function BioProvider({
+  initial,
+  children,
+  userId,
+}: {
+  initial: BioBundle;
+  userId: string;
+  children: ReactNode;
+}) {
+  const [bundle, setBundle] = useState<BioBundle>(initial);
+  const [saveState, setSaveState] = useState<SaveState>("idle");
+  const [publishing, setPublishing] = useState(false);
+  const timers = useRef<Record<string, ReturnType<typeof setTimeout>>>({});
+  const savedTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  useEffect(() => {
+    return () => {
+      Object.values(timers.current).forEach(clearTimeout);
+      if (savedTimer.current) clearTimeout(savedTimer.current);
+    };
+  }, []);
+
+  const finishSave = useCallback(() => {
+    setSaveState("saved");
+    if (savedTimer.current) clearTimeout(savedTimer.current);
+    savedTimer.current = setTimeout(() => setSaveState("idle"), 2200);
+  }, []);
+
+  const schedule = useCallback(
+    (key: string, run: () => Promise<void>, delay = 700) => {
+      setSaveState("saving");
+      const existing = timers.current[key];
+      if (existing) clearTimeout(existing);
+      timers.current[key] = setTimeout(() => {
+        run()
+          .then(finishSave)
+          .catch(() => {
+            setSaveState("idle");
+            toast.error("Não conseguimos salvar essa alteração.");
+          });
+      }, delay);
+    },
+    [finishSave],
+  );
+
+  const theme = useMemo(() => mergeTheme(bundle.page.theme), [bundle.page.theme]);
+
+  const patchProfile = useCallback(
+    (patch: Partial<BioProfile>) => {
+      setBundle((prev) => ({ ...prev, profile: { ...prev.profile, ...patch } }));
+      schedule("profile", async () => {
+        await updateProfile(userId, patch);
+      });
+    },
+    [schedule, userId],
+  );
+
+  const patchTheme = useCallback(
+    (patch: Partial<BioTheme>) => {
+      setBundle((prev) => {
+        const nextTheme = { ...mergeTheme(prev.page.theme), ...patch };
+        return { ...prev, page: { ...prev.page, theme: nextTheme } };
+      });
+      schedule("theme", async () => {
+        const merged = { ...mergeTheme(bundleRef.current.page.theme) };
+        await updatePage(bundleRef.current.page.id, { theme: merged });
+      });
+    },
+    [schedule],
+  );
+
+  const bundleRef = useRef(bundle);
+  useEffect(() => {
+    bundleRef.current = bundle;
+  }, [bundle]);
+
+  const applyTemplate = useCallback(
+    (templateId: string) => {
+      const tpl = getTemplate(templateId);
+      setBundle((prev) => ({
+        ...prev,
+        page: { ...prev.page, template: tpl.id, theme: { ...tpl.theme } },
+      }));
+      schedule(
+        "template",
+        async () => {
+          await updatePage(bundleRef.current.page.id, {
+            template: tpl.id,
+            theme: { ...tpl.theme },
+          });
+        },
+        250,
+      );
+    },
+    [schedule],
+  );
+
+  const addBlock = useCallback(
+    async (type: string) => {
+      const def = getBlockDef(type);
+      setSaveState("saving");
+      try {
+        const created = await apiCreateBlock({
+          page_id: bundleRef.current.page.id,
+          user_id: userId,
+          type,
+          title: def.social ? def.label : type === "text" ? "" : "Novo link",
+          url: null,
+          config: type === "text" ? { text: "Escreva algo sobre você" } : {},
+          position: bundleRef.current.blocks.length,
+        });
+        setBundle((prev) => ({ ...prev, blocks: [...prev.blocks, created] }));
+        finishSave();
+      } catch {
+        setSaveState("idle");
+        toast.error("Não foi possível adicionar o bloco.");
+      }
+    },
+    [finishSave, userId],
+  );
+
+  const patchBlock = useCallback<BioContextValue["patchBlock"]>(
+    (id, patch) => {
+      setBundle((prev) => ({
+        ...prev,
+        blocks: prev.blocks.map((b) =>
+          b.id === id
+            ? {
+                ...b,
+                ...(patch.title !== undefined ? { title: patch.title } : {}),
+                ...(patch.url !== undefined ? { url: patch.url } : {}),
+                ...(patch.is_visible !== undefined ? { is_visible: patch.is_visible } : {}),
+                ...(patch.config !== undefined ? { config: { ...b.config, ...patch.config } } : {}),
+              }
+            : b,
+        ),
+      }));
+      schedule(`block:${id}`, async () => {
+        const current = bundleRef.current.blocks.find((b) => b.id === id);
+        if (!current) return;
+        await apiUpdateBlock(id, {
+          title: current.title,
+          url: current.url,
+          config: current.config,
+          is_visible: current.is_visible,
+        });
+      });
+    },
+    [schedule],
+  );
+
+  const duplicateBlock = useCallback(
+    async (id: string) => {
+      const source = bundleRef.current.blocks.find((b) => b.id === id);
+      if (!source) return;
+      setSaveState("saving");
+      try {
+        const created = await apiCreateBlock({
+          page_id: source.page_id,
+          user_id: userId,
+          type: source.type,
+          title: source.title,
+          url: source.url,
+          config: source.config,
+          position: bundleRef.current.blocks.length,
+        });
+        setBundle((prev) => ({ ...prev, blocks: [...prev.blocks, created] }));
+        finishSave();
+      } catch {
+        setSaveState("idle");
+        toast.error("Não foi possível duplicar o bloco.");
+      }
+    },
+    [finishSave, userId],
+  );
+
+  const removeBlock = useCallback(
+    async (id: string) => {
+      const snapshot = bundleRef.current.blocks;
+      setBundle((prev) => ({ ...prev, blocks: prev.blocks.filter((b) => b.id !== id) }));
+      setSaveState("saving");
+      try {
+        await apiDeleteBlock(id);
+        finishSave();
+      } catch {
+        setBundle((prev) => ({ ...prev, blocks: snapshot }));
+        setSaveState("idle");
+        toast.error("Não foi possível excluir o bloco.");
+      }
+    },
+    [finishSave],
+  );
+
+  const moveBlock = useCallback(
+    (fromId: string, toIndex: number) => {
+      setBundle((prev) => {
+        const list = [...prev.blocks];
+        const fromIndex = list.findIndex((b) => b.id === fromId);
+        if (fromIndex < 0) return prev;
+        const [moved] = list.splice(fromIndex, 1);
+        if (!moved) return prev;
+        const clamped = Math.max(0, Math.min(toIndex, list.length));
+        list.splice(clamped, 0, moved);
+        const reindexed: BioBlock[] = list.map((b, i) => ({ ...b, position: i }));
+        return { ...prev, blocks: reindexed };
+      });
+      schedule(
+        "reorder",
+        async () => {
+          await apiReorderBlocks(bundleRef.current.blocks);
+        },
+        400,
+      );
+    },
+    [schedule],
+  );
+
+  const publish = useCallback(async () => {
+    setPublishing(true);
+    try {
+      const now = new Date().toISOString();
+      await updatePage(bundleRef.current.page.id, { is_published: true, published_at: now });
+      setBundle((prev) => ({
+        ...prev,
+        page: { ...prev.page, is_published: true, published_at: now },
+      }));
+    } catch {
+      toast.error("Não foi possível publicar agora.");
+    } finally {
+      setPublishing(false);
+    }
+  }, []);
+
+  const refresh = useCallback(async () => {
+    const next = await fetchMyBio(userId);
+    setBundle(next);
+  }, [userId]);
+
+  const value = useMemo<BioContextValue>(
+    () => ({
+      bundle,
+      theme,
+      saveState,
+      publishing,
+      patchProfile,
+      patchTheme,
+      applyTemplate,
+      addBlock,
+      patchBlock,
+      duplicateBlock,
+      removeBlock,
+      moveBlock,
+      publish,
+      refresh,
+    }),
+    [
+      bundle,
+      theme,
+      saveState,
+      publishing,
+      patchProfile,
+      patchTheme,
+      applyTemplate,
+      addBlock,
+      patchBlock,
+      duplicateBlock,
+      removeBlock,
+      moveBlock,
+      publish,
+      refresh,
+    ],
+  );
+
+  return <BioContext.Provider value={value}>{children}</BioContext.Provider>;
+}

@@ -81,8 +81,13 @@ export async function fetchMyBio(userId: string): Promise<BioBundle> {
   };
 }
 
+/** Supabase's generated Json type is structural; our typed shapes need a cast. */
+function asJson(value: unknown): never {
+  return value as never;
+}
+
 export async function updateProfile(userId: string, patch: Partial<BioProfile>) {
-  const { error } = await supabase.from("profiles").update(patch).eq("id", userId);
+  const { error } = await supabase.from("profiles").update(asJson(patch)).eq("id", userId);
   if (error) throw error;
 }
 
@@ -90,7 +95,7 @@ export async function updatePage(
   pageId: string,
   patch: { theme?: Partial<BioTheme>; template?: string; is_published?: boolean; published_at?: string },
 ) {
-  const { error } = await supabase.from("pages").update(patch).eq("id", pageId);
+  const { error } = await supabase.from("pages").update(asJson(patch)).eq("id", pageId);
   if (error) throw error;
 }
 
@@ -105,15 +110,17 @@ export async function createBlock(input: {
 }) {
   const { data, error } = await supabase
     .from("page_blocks")
-    .insert({
-      page_id: input.page_id,
-      user_id: input.user_id,
-      type: input.type,
-      title: input.title ?? null,
-      url: input.url ?? null,
-      config: input.config ?? {},
-      position: input.position,
-    })
+    .insert(
+      asJson({
+        page_id: input.page_id,
+        user_id: input.user_id,
+        type: input.type,
+        title: input.title ?? null,
+        url: input.url ?? null,
+        config: input.config ?? {},
+        position: input.position,
+      }),
+    )
     .select("*")
     .single();
   if (error) throw error;
@@ -130,7 +137,7 @@ export async function updateBlock(
     position?: number;
   },
 ) {
-  const { error } = await supabase.from("page_blocks").update(patch).eq("id", id);
+  const { error } = await supabase.from("page_blocks").update(asJson(patch)).eq("id", id);
   if (error) throw error;
 }
 
